@@ -1,0 +1,16 @@
+{
+  "name": "P.I.N.G. — Protection In Nigeria",
+  "short_name": "P.I.N.G.",
+  "description": "Community safety mesh for Nigeria",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080b0f",
+  "theme_color": "#080b0f",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "categories": ["utilities", "social"],
+  "lang": "en-NG"
+}
