@@ -1,18 +1,18 @@
 -- ══════════════════════════════════════════════════════════════════
---  P.I.N.G. — Full Database & Auth Schema v2
---  Run once in: Supabase → SQL Editor → New Query → Run
+--  P.I.N.G. — Full Database Schema v20
+--  Run this ONCE in: Supabase → SQL Editor → New Query → Run All
+--  This is safe to re-run — all statements use IF NOT EXISTS / ON CONFLICT DO NOTHING
 -- ══════════════════════════════════════════════════════════════════
 
--- ── 1. User profiles (extends Supabase auth.users) ───────────────
+-- ── 1. Users ──────────────────────────────────────────────────────
 create table if not exists ping_users (
   id            uuid primary key references auth.users(id) on delete cascade,
-  first_name    text not null,
-  last_name     text not null,
+  first_name    text not null default '',
+  last_name     text not null default '',
   email         text,
   phone         text,
   username      text unique,
-  role          text not null default 'resident'
-                  check (role in ('resident','vanguard','admin')),
+  role          text not null default 'resident' check (role in ('resident','vanguard','admin')),
   village_id    text,
   village_name  text,
   village_key   text,
@@ -22,49 +22,46 @@ create table if not exists ping_users (
   last_seen     timestamptz,
   created_at    timestamptz not null default now()
 );
-
--- Add username column if upgrading from v1
 alter table ping_users add column if not exists username text unique;
 alter table ping_users add column if not exists email text;
 alter table ping_users add column if not exists language text default 'en';
-alter table ping_users alter column phone drop not null;
+alter table ping_users alter column first_name set default '';
+alter table ping_users alter column last_name  set default '';
+alter table ping_users alter column phone      drop not null;
 alter table ping_users alter column village_id drop not null;
 alter table ping_users alter column village_name drop not null;
-alter table ping_users alter column village_key drop not null;
+alter table ping_users alter column village_key  drop not null;
+create index if not exists idx_ping_users_username  on ping_users(username);
+create index if not exists idx_ping_users_village   on ping_users(village_key);
+create index if not exists idx_ping_users_email     on ping_users(email);
 
--- ── 2. Villages registry ──────────────────────────────────────────
-create table if not exists ping_villages (
-  id          text primary key,
-  name        text not null,
-  access_key  text not null unique,
-  region      text,
-  is_active   boolean not null default true,
-  created_at  timestamptz not null default now()
-);
-
-insert into ping_villages (id, name, access_key, region) values
-  ('v000', 'Test Community',       'TEST00', 'Test'),
-  ('v001', 'Zamfara North Sector', 'PING01', 'Zamfara'),
-  ('v002', 'Kaduna East Sector',   'PING02', 'Kaduna'),
-  ('v003', 'Katsina West Sector',  'PING03', 'Katsina')
-on conflict (id) do nothing;
-
--- ── 3. Messages / alerts ──────────────────────────────────────────
+-- ── 2. Messages (community chat — scoped to village_key) ──────────
 create table if not exists ping_messages (
   id          uuid primary key default gen_random_uuid(),
-  village_id  text not null,
+  village_id  text not null,          -- this IS the village_key e.g. 'FCT-GWA1234'
   user_id     uuid references ping_users(id) on delete set null,
   username    text not null,
   message     text not null,
-  type        text not null default 'MSG'
-                check (type in ('MSG','SOS','ALL_CLEAR','SYSTEM')),
+  type        text not null default 'MSG' check (type in ('MSG','SOS','ALL_CLEAR','SYSTEM')),
   lat         double precision,
   lng         double precision,
   created_at  timestamptz not null default now()
 );
+create index if not exists idx_ping_messages_village on ping_messages(village_id, created_at desc);
+create index if not exists idx_ping_messages_user    on ping_messages(user_id, created_at desc);
 
-create index if not exists idx_ping_messages_village
-  on ping_messages(village_id, created_at desc);
+-- ── 3. Direct messages ────────────────────────────────────────────
+create table if not exists ping_direct_messages (
+  id              uuid primary key default gen_random_uuid(),
+  from_username   text not null,
+  to_username     text not null,
+  from_user_id    uuid references ping_users(id) on delete set null,
+  message         text not null,
+  read_at         timestamptz,
+  created_at      timestamptz not null default now()
+);
+create index if not exists idx_ping_dm_pair on ping_direct_messages(from_username, to_username, created_at desc);
+create index if not exists idx_ping_dm_to   on ping_direct_messages(to_username, created_at desc);
 
 -- ── 4. SOS events ─────────────────────────────────────────────────
 create table if not exists ping_sos_events (
@@ -75,118 +72,101 @@ create table if not exists ping_sos_events (
   phone       text,
   lat         double precision,
   lng         double precision,
-  status      text not null default 'active'
-                check (status in ('active','resolved','false_alarm')),
+  status      text not null default 'active' check (status in ('active','resolved','false_alarm')),
   created_at  timestamptz not null default now(),
   resolved_at timestamptz
 );
+create index if not exists idx_ping_sos_village on ping_sos_events(village_id, created_at desc);
 
--- ── 5. Row Level Security ─────────────────────────────────────────
-
-alter table ping_users enable row level security;
-
--- Allow users to view own profile
-drop policy if exists "Users can view own profile" on ping_users;
-create policy "Users can view own profile"
-  on ping_users for select
-  using (auth.uid() = id);
-
--- Allow users to search other users (for @mention feature)
-drop policy if exists "Users can search all profiles" on ping_users;
-create policy "Users can search all profiles"
-  on ping_users for select
-  using (auth.uid() is not null);
-
-drop policy if exists "Users can update own profile" on ping_users;
-create policy "Users can update own profile"
-  on ping_users for update
-  using (auth.uid() = id);
-
-drop policy if exists "Users can insert own profile" on ping_users;
-create policy "Users can insert own profile"
-  on ping_users for insert
-  with check (auth.uid() = id);
-
-alter table ping_villages enable row level security;
-
-drop policy if exists "Anyone can read villages" on ping_villages;
-create policy "Anyone can read villages"
-  on ping_villages for select using (true);
-
-alter table ping_messages enable row level security;
-
-drop policy if exists "Village members can read messages" on ping_messages;
-create policy "Village members can read messages"
-  on ping_messages for select using (true);
-
-drop policy if exists "Authenticated users can insert messages" on ping_messages;
-create policy "Authenticated users can insert messages"
-  on ping_messages for insert
-  with check (auth.uid() is not null);
-
-alter table ping_sos_events enable row level security;
-
-drop policy if exists "Village members can read SOS events" on ping_sos_events;
-create policy "Village members can read SOS events"
-  on ping_sos_events for select using (true);
-
-drop policy if exists "Authenticated users can insert SOS" on ping_sos_events;
-create policy "Authenticated users can insert SOS"
-  on ping_sos_events for insert
-  with check (auth.uid() is not null);
-
--- ── 6. Village key validation function ───────────────────────────
-create or replace function validate_village_key(key text)
-returns json language sql security definer as $$
-  select json_build_object(
-    'valid',        (count(*) > 0),
-    'village_id',   max(id),
-    'village_name', max(name)
-  )
-  from ping_villages
-  where access_key = upper(trim(key))
-    and is_active = true;
-$$;
-
--- ── 7. Realtime — IMPORTANT: enable for chat ──────────────────────
--- Run these in Supabase Dashboard → Database → Replication
--- OR uncomment if your Supabase version supports it here:
+-- ── 5. Realtime publications ──────────────────────────────────────
 alter publication supabase_realtime add table ping_messages;
+alter publication supabase_realtime add table ping_direct_messages;
 alter publication supabase_realtime add table ping_sos_events;
 
--- ── 8. Auto-cleanup: delete messages older than 7 days ────────────
-create or replace function delete_old_ping_messages()
-returns void language sql as $$
-  delete from ping_messages where created_at < now() - interval '7 days';
+-- ── 6. Row Level Security ─────────────────────────────────────────
+alter table ping_users              enable row level security;
+alter table ping_messages           enable row level security;
+alter table ping_direct_messages    enable row level security;
+alter table ping_sos_events         enable row level security;
+
+-- Users: view own + search others
+drop policy if exists "view own"   on ping_users;
+drop policy if exists "search all" on ping_users;
+drop policy if exists "update own" on ping_users;
+drop policy if exists "insert own" on ping_users;
+create policy "view own"   on ping_users for select using (true);
+create policy "update own" on ping_users for update using (auth.uid() = id);
+create policy "insert own" on ping_users for insert with check (auth.uid() = id);
+
+-- Messages: anyone authenticated (or anon) can read/write community chat
+drop policy if exists "read messages"   on ping_messages;
+drop policy if exists "insert messages" on ping_messages;
+create policy "read messages"   on ping_messages for select using (true);
+create policy "insert messages" on ping_messages for insert with check (true);
+
+-- Direct messages: anyone can read/insert (username-gated in app)
+drop policy if exists "read dms"   on ping_direct_messages;
+drop policy if exists "insert dms" on ping_direct_messages;
+create policy "read dms"   on ping_direct_messages for select using (true);
+create policy "insert dms" on ping_direct_messages for insert with check (true);
+
+-- SOS: anyone can read/insert
+drop policy if exists "read sos"   on ping_sos_events;
+drop policy if exists "insert sos" on ping_sos_events;
+create policy "read sos"   on ping_sos_events for select using (true);
+create policy "insert sos" on ping_sos_events for insert with check (true);
+
+-- ── 7. Email confirmation settings ───────────────────────────────
+-- Run this in Supabase Dashboard → Authentication → Settings:
+--   • Confirm email: OFF (for testing) OR keep ON and ensure SMTP is configured
+--   • Site URL: https://pingfinalng.vercel.app
+--   • Redirect URLs: https://pingfinalng.vercel.app/auth/callback
+--   • Email templates: use default (they work out of the box)
+
+-- ── 8. Search function (fast username/name search) ────────────────
+create or replace function search_ping_users(q text)
+returns table(id uuid, username text, first_name text, last_name text, village_key text, village_name text)
+language sql stable
+as $$
+  select id, username, first_name, last_name, village_key, village_name
+  from ping_users
+  where
+    username    ilike '%' || q || '%' or
+    first_name  ilike '%' || q || '%' or
+    last_name   ilike '%' || q || '%'
+  order by
+    case when username ilike q || '%' then 0 else 1 end,
+    username
+  limit 20;
 $$;
 
--- ── 7. Direct Messages ────────────────────────────────────────────
-create table if not exists ping_direct_messages (
-  id              uuid primary key default gen_random_uuid(),
-  from_username   text not null,
-  to_username     text not null,
-  from_user_id    uuid references ping_users(id) on delete set null,
-  message         text not null,
-  read_at         timestamptz,
-  created_at      timestamptz not null default now()
+-- ══════════════════════════════════════════════════════════════════
+-- v23: Emergency Contacts
+-- ══════════════════════════════════════════════════════════════════
+create table if not exists ping_emergency_contacts (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references ping_users(id) on delete cascade,
+  name        text not null,
+  phone       text not null,
+  email       text,
+  relation    text default 'Other',
+  notify_sos  boolean not null default true,
+  created_at  timestamptz not null default now()
 );
+create index if not exists idx_ping_ec_user on ping_emergency_contacts(user_id);
+alter table ping_emergency_contacts enable row level security;
+drop policy if exists "ec_select" on ping_emergency_contacts;
+drop policy if exists "ec_insert" on ping_emergency_contacts;
+drop policy if exists "ec_update" on ping_emergency_contacts;
+drop policy if exists "ec_delete" on ping_emergency_contacts;
+create policy "ec_select" on ping_emergency_contacts for select using (auth.uid() = user_id);
+create policy "ec_insert" on ping_emergency_contacts for insert with check (auth.uid() = user_id);
+create policy "ec_update" on ping_emergency_contacts for update using (auth.uid() = user_id);
+create policy "ec_delete" on ping_emergency_contacts for delete using (auth.uid() = user_id);
 
-create index if not exists idx_ping_dm_participants
-  on ping_direct_messages(from_username, to_username, created_at desc);
+-- Add to realtime so contact list updates instantly
+alter publication supabase_realtime add table ping_emergency_contacts;
 
--- RLS: users can only read DMs they're part of
-alter table ping_direct_messages enable row level security;
-
-create policy if not exists "users_see_own_dms"
-  on ping_direct_messages for select
-  using (
-    from_username = (select username from ping_users where id = auth.uid())
-    or
-    to_username   = (select username from ping_users where id = auth.uid())
-  );
-
-create policy if not exists "users_send_dms"
-  on ping_direct_messages for insert
-  with check (
-    from_username = (select username from ping_users where id = auth.uid())
-  );
+-- Edge function webhook placeholder (set up in Supabase → Edge Functions)
+-- When an SOS is inserted, trigger: notify_emergency_contacts(sos_event_id)
+-- See: supabase/functions/notify-contacts/index.ts in this project

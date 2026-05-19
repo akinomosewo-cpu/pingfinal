@@ -2,9 +2,11 @@
 	import { onMount, onDestroy, tick } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { userAuth, searchUsers } from '$lib/auth.svelte.js';
+	import { i18n, t } from '$lib/i18n.js';
+	const T = $derived((key) => t($i18n.lang, key));
 	import { isSupabaseReady } from '$lib/supabase.js';
 	import {
-		chatState, initChat, destroyChat,
+		chatStore, initChat, destroyChat,
 		sendMessage, sendDM, openDM, closeDM,
 		startTyping, stopTyping
 	} from '$lib/chat.svelte.js';
@@ -16,25 +18,33 @@
 	let activeTab  = $state('community'); // 'community' | 'private'
 
 	// User search for DM
-	let showSearch    = $state(false);
-	let searchQuery   = $state('');
-	let searchResults = $state([]);
-	let searchLoading = $state(false);
-	let searchTimer   = null;
+	let showSearch      = $state(false);
+	let searchQuery     = $state('');
+	let searchResults   = $state([]);
+	let suggestedUsers  = $state([]); // shown before user types
+	let searchLoading   = $state(false);
+	let searchTimer     = null;
 
 	$effect(() => {
 		if (!showSearch) { searchQuery = ''; searchResults = []; }
+		else if (suggestedUsers.length === 0) {
+			// Reload if empty
+			searchUsers('').then(r => {
+				suggestedUsers = r.filter(u => u.username !== $userAuth.username).slice(0, 20);
+			}).catch(() => {});
+		}
 	});
 
 	async function onSearchInput() {
 		clearTimeout(searchTimer);
-		const q = searchQuery.trim();
+		// Strip @ prefix so @username searches work
+		const q = searchQuery.trim().replace(/^@+/, '');
 		if (!q) { searchResults = []; return; }
 		searchTimer = setTimeout(async () => {
 			searchLoading = true;
 			searchResults = await searchUsers(q);
 			searchLoading = false;
-		}, 320);
+		}, 150);
 	}
 
 	function mentionUser(username) {
@@ -58,11 +68,26 @@
 
 	onMount(async () => {
 		if (!$userAuth.isVerified) { goto('/'); return; }
+		// Pre-load suggested users (all users in this village) for instant display
+		try {
+			const all = await searchUsers('');
+			suggestedUsers = all.filter(u => u.username !== $userAuth.username).slice(0, 20);
+		} catch {}
 		const uname = $userAuth.username || ($userAuth.firstName + ' ' + $userAuth.lastName).trim() || 'User';
+		// Use villageKey (district code like 'FCT-GWA1781') as community scope
+		// If user has no villageKey (signed up before v20), fall back to villageId or ng-general
+		// Strip the user-ID suffix from villageKey to get the shared district channel
+		// e.g. 'FCT-GWA1a2b' → 'FCT-GWA' so all Gwarimpa users share one chat
+		const rawVk = $userAuth.villageKey?.trim() || $userAuth.villageId?.trim() || '';
+		// Remove trailing alphanumeric suffix (last 4 chars if they look like a uid fragment)
+		const vk = rawVk
+			? rawVk.replace(/[a-f0-9]{4,}$/i, '').replace(/-$/, '') || rawVk
+			: ($userAuth.region?.key || 'NG');
 		await initChat({
-			villageId: $userAuth.villageId ?? 'default',
-			username:  uname,
-			userId:    $userAuth.userId ?? null,
+			villageId:  $userAuth.villageId ?? null,
+			villageKey: vk,
+			username:   uname,
+			userId:     $userAuth.userId ?? null,
 		});
 		await tick();
 		scrollBottom('instant');
@@ -71,11 +96,11 @@
 	onDestroy(destroyChat);
 
 	$effect(() => {
-		if (chatState.messages.length) tick().then(() => scrollBottom('smooth'));
+		if ($chatStore.messages.length) tick().then(() => scrollBottom('smooth'));
 	});
 
 	$effect(() => {
-		if (chatState.privateChats) tick().then(() => scrollBottom('smooth'));
+		if ($chatStore.privateChats) tick().then(() => scrollBottom('smooth'));
 	});
 
 	function scrollBottom(behavior = 'smooth') {
@@ -87,8 +112,8 @@
 		if (!msg || sending) return;
 		sending = true;
 		text = '';
-		if (activeTab === 'private' && chatState.activeDM) {
-			await sendDM(chatState.activeDM, msg);
+		if (activeTab === 'private' && $chatStore.activeDM) {
+			await sendDM($chatStore.activeDM, msg);
 		} else {
 			await sendMessage(msg);
 		}
@@ -110,10 +135,10 @@
 	}
 
 	const activeMessages = $derived(() => {
-		if (activeTab === 'private' && chatState.activeDM) {
-			return chatState.privateChats[chatState.activeDM] ?? [];
+		if (activeTab === 'private' && $chatStore.activeDM) {
+			return $chatStore.privateChats[$chatStore.activeDM] ?? [];
 		}
-		return chatState.messages;
+		return $chatStore.messages;
 	});
 
 	const groups = $derived(() => {
@@ -149,7 +174,7 @@
 		broadcast: { icon: '📶', text: 'Local',   cls: 'local'   },
 		storage:   { icon: '💾', text: 'Offline', cls: 'offline' },
 		none:      { icon: '⏳', text: '…',       cls: 'none'    },
-	}[chatState.transport] ?? { icon: '⏳', text: '…', cls: 'none' }));
+	}[$chatStore.transport] ?? { icon: '⏳', text: '…', cls: 'none' }));
 
 	function statusIcon(status) {
 		if (status === 'delivered') return '✓✓';
@@ -160,7 +185,7 @@
 
 	// DM conversations list
 	const dmConversations = $derived(() => {
-		return Object.entries(chatState.privateChats).map(([user, msgs]) => ({
+		return Object.entries($chatStore.privateChats).map(([user, msgs]) => ({
 			user,
 			lastMsg: msgs[msgs.length - 1],
 			unread: msgs.filter(m => !m.self && !m.read).length,
@@ -168,8 +193,9 @@
 	});
 
 	const chatTitle = $derived(() => {
-		if (activeTab === 'private' && chatState.activeDM) return `@${chatState.activeDM}`;
-		return `${$userAuth.villageDisplayName || $userAuth.villageId || 'Community'} Chat`;
+		if (activeTab === 'private' && $chatStore.activeDM) return `@${$chatStore.activeDM}`;
+		const vn = $userAuth.villageDisplayName || $userAuth.villageKey?.replace(/-w+$/, '') || 'Nigeria';
+		return `${vn} Chat`;
 	});
 </script>
 
@@ -189,9 +215,9 @@
 			<span class="head-title">{chatTitle()}</span>
 			<span class="head-village">
 				{#if $userAuth.username}<span class="head-user">@{$userAuth.username}</span>{/if}
-				{#if activeTab === 'community' && chatState.onlineCount > 0}
+				{#if activeTab === 'community' && $chatStore.onlineCount > 0}
 					<span class="online-pill">
-						<span class="green-dot"></span>{chatState.onlineCount} online
+						<span class="green-dot"></span>{$chatStore.onlineCount} online
 					</span>
 				{/if}
 			</span>
@@ -236,7 +262,7 @@
 				</svg>
 				<!-- svelte-ignore a11y_autofocus -->
 				<input class="search-input" bind:value={searchQuery} oninput={onSearchInput}
-					placeholder={activeTab === 'private' ? 'Find user to DM…' : 'Search @username to mention…'}
+					placeholder="Search by name or @username…"
 					autofocus />
 				{#if searchQuery}
 					<button class="clear-btn" onclick={() => { searchQuery = ''; searchResults = []; }}>✕</button>
@@ -244,29 +270,45 @@
 			</div>
 			{#if searchLoading}
 				<div class="search-status">Searching…</div>
+
 			{:else if searchQuery.trim() && searchResults.length === 0}
-				<div class="search-status">No users found.</div>
+				<div class="search-status">{T('noUsersFound')}</div>
+
 			{:else if searchResults.length > 0}
+				<!-- Search results -->
+				<p class="results-label">{T('results')}</p>
 				<div class="search-results">
 					{#each searchResults as u}
 						<button class="result-row" onclick={() => mentionUser(u.username)}>
-							<div class="result-avatar">{(u.username ?? u.first_name ?? '?')[0].toUpperCase()}</div>
+							<div class="result-avatar">{(u.first_name ?? u.username ?? '?')[0].toUpperCase()}</div>
 							<div class="result-info">
-								<span class="result-name">@{u.username}</span>
-								<span class="result-sub">{u.first_name} {u.last_name} · {u.village_name ?? ''}</span>
+								<span class="result-name">{u.first_name ?? ''} {u.last_name ?? ''}</span>
+								<span class="result-sub">@{u.username} · {u.village_name ?? u.village_key ?? 'Nigeria'}</span>
 							</div>
-							{#if activeTab === 'private'}
-								<span class="dm-start-badge">DM →</span>
-							{:else}
-								<span class="result-key">{u.village_key ?? ''}</span>
-							{/if}
+							<span class="dm-start-badge">DM →</span>
 						</button>
 					{/each}
 				</div>
+
 			{:else}
-				<div class="search-hint">
-					{activeTab === 'private' ? 'Search by name or @username to start a private chat.' : 'Search for community members to @mention them.'}
-				</div>
+				<!-- No query yet — show all users in region -->
+				{#if suggestedUsers.length > 0}
+					<p class="results-label">{T('peopleArea')}</p>
+					<div class="search-results">
+						{#each suggestedUsers as u}
+							<button class="result-row" onclick={() => mentionUser(u.username)}>
+								<div class="result-avatar">{(u.first_name ?? u.username ?? '?')[0].toUpperCase()}</div>
+								<div class="result-info">
+									<span class="result-name">{u.first_name ?? ''} {u.last_name ?? ''}</span>
+									<span class="result-sub">@{u.username} · {u.village_name ?? u.village_key ?? 'Nigeria'}</span>
+								</div>
+								<span class="dm-start-badge">DM →</span>
+							</button>
+						{/each}
+					</div>
+				{:else}
+					<div class="search-hint">{T('typeToSearch')}</div>
+				{/if}
 			{/if}
 		</div>
 	{/if}
@@ -277,17 +319,17 @@
 		</div>
 	{/if}
 
-	{#if chatState.error}
-		<div class="err-banner">{chatState.error}</div>
+	{#if $chatStore.error}
+		<div class="err-banner">{$chatStore.error}</div>
 	{/if}
 
 	<!-- PRIVATE: DM list or active DM -->
-	{#if activeTab === 'private' && !chatState.activeDM}
+	{#if activeTab === 'private' && !$chatStore.activeDM}
 		<div class="log dm-list">
 			{#if dmConversations().length === 0}
 				<div class="empty">
 					<div class="empty-ico">🔒</div>
-					<p>No private chats yet.</p>
+					<p>{T('noDMs')}</p>
 					<p class="empty-sub">Tap <strong>+</strong> to search and DM someone by username.</p>
 				</div>
 			{:else}
@@ -312,7 +354,7 @@
 	{:else}
 		<!-- Message log (community or active DM) -->
 		<div class="log" bind:this={logEl}>
-			{#if chatState.loading}
+			{#if $chatStore.loading}
 				<div class="loading-wrap">
 					<div class="spinner"></div>
 					<span class="loading-txt">Loading messages…</span>
@@ -320,7 +362,7 @@
 			{:else if activeMessages().length === 0}
 				<div class="empty">
 					<div class="empty-ico">{activeTab === 'private' ? '🔒' : '💬'}</div>
-					<p>{activeTab === 'private' ? `Start a private chat with @${chatState.activeDM}` : 'No messages yet — say hello.'}</p>
+					<p>{activeTab === 'private' ? `Start a private chat with @${$chatStore.activeDM}` : T('noMessages')}</p>
 				</div>
 			{:else}
 				{#each dayGroups() as item}
@@ -353,11 +395,11 @@
 					{/if}
 				{/each}
 
-				{#if chatState.typingUsers.length > 0 && activeTab === 'community'}
+				{#if $chatStore.typingUsers.length > 0 && activeTab === 'community'}
 					<div class="group other">
 						<div class="avatar typing-avatar">···</div>
 						<div class="bubble-col">
-							<span class="sender">{chatState.typingUsers.join(', ')} typing…</span>
+							<span class="sender">{$chatStore.typingUsers.join(', ')} typing…</span>
 							<div class="bubble other typing-bubble">
 								<span class="typing-dot"></span>
 								<span class="typing-dot"></span>
@@ -372,7 +414,7 @@
 
 		<!-- Composer -->
 		<form class="composer" onsubmit={(e) => { e.preventDefault(); submit(); }}>
-			{#if activeTab === 'private' && chatState.activeDM}
+			{#if activeTab === 'private' && $chatStore.activeDM}
 				<button type="button" class="back-dm" onclick={closeDM}>←</button>
 			{/if}
 			<textarea
@@ -380,7 +422,7 @@
 				bind:value={text}
 				onkeydown={onKey}
 				onblur={stopTyping}
-				placeholder={activeTab === 'private' ? `Message @${chatState.activeDM}…` : 'Message your community…'}
+				placeholder={activeTab === 'private' ? T('messageDMPlaceholder') + ' @' + ($chatStore.activeDM??'') + '…' : T('messageComm')}
 				rows="1"
 				maxlength="500"
 				class="composer-input"

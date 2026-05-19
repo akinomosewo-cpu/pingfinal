@@ -40,6 +40,134 @@
 	let createdUsername = $state('');
 	let createdVillageKey = $state('');
 
+	// ── WhatsApp OTP verification ────────────────────────────────────
+	let otpCode      = $state('');      // generated 6-digit code
+	let otpEntry     = $state('');      // what user types
+	let otpError     = $state('');
+	let otpSent      = $state(false);
+	let otpVerified  = $state(false);
+	let otpAttempts  = $state(0);
+
+	function generateOTP() {
+		return String(Math.floor(100000 + Math.random() * 900000));
+	}
+
+	function buildWALink(phoneNum, code) {
+		const normalised = phoneNum.replace(/^0/, '234').replace(/\D/g,'');
+		const msg = encodeURIComponent(
+			`Your P.I.N.G. verification code is: *${code}*\n\nThis code expires in 10 minutes. Do not share it with anyone.\n\n— P.I.N.G. Protection In Nigeria`
+		);
+		return `https://wa.me/${normalised}?text=${msg}`;
+	}
+
+	async function sendWhatsAppOTP() {
+		otpError = '';
+		if (!phone.trim()) { otpError = 'Enter your phone number first.'; return; }
+		const code = generateOTP();
+		otpCode = code; // keep in memory as cache
+		
+		// Store in Supabase so it survives tab close/refresh
+		try {
+			const { supabase } = await import('$lib/supabase.js');
+			if (supabase) {
+				// Delete old codes for this phone first
+				await supabase.from('ping_otp_codes')
+					.delete().eq('phone', phone.trim());
+				// Insert new code
+				await supabase.from('ping_otp_codes')
+					.insert({ phone: phone.trim(), code });
+			}
+		} catch {}
+		
+		// Also persist to localStorage as fallback
+		try {
+			localStorage.setItem('ping_otp_session', JSON.stringify({
+				phone: phone.trim(), code, expires: Date.now() + 10 * 60 * 1000
+			}));
+		} catch {}
+		
+		otpSent = true;
+		// Open WhatsApp — user sends the message to themselves
+		window.open(buildWALink(phone.trim(), code), '_blank');
+	}
+
+	async function verifyOTP() {
+		otpError = '';
+		if (otpAttempts >= 5) { otpError = 'Too many attempts. Please restart.'; return; }
+
+		const entered = otpEntry.trim();
+		if (!entered || entered.length < 6) { otpError = 'Enter the full 6-digit code.'; return; }
+
+		// If tab was closed and otpCode is empty, reload from Supabase or localStorage
+		if (!otpCode) {
+			// Try Supabase first
+			try {
+				const { supabase } = await import('$lib/supabase.js');
+				if (supabase) {
+					const { data } = await supabase
+						.from('ping_otp_codes')
+						.select('code, expires_at, used')
+						.eq('phone', phone.trim())
+						.eq('used', false)
+						.gte('expires_at', new Date().toISOString())
+						.order('created_at', { ascending: false })
+						.limit(1)
+						.single();
+					if (data?.code) otpCode = data.code;
+				}
+			} catch {}
+			
+			// Fallback: localStorage
+			if (!otpCode) {
+				try {
+					const saved = JSON.parse(localStorage.getItem('ping_otp_session') || '{}');
+					if (saved.phone === phone.trim() && saved.expires > Date.now()) {
+						otpCode = saved.code;
+						otpSent = true; // show the input field
+					}
+				} catch {}
+			}
+			
+			if (!otpCode) {
+				otpError = 'Code expired or not found. Tap "Resend code".';
+				return;
+			}
+		}
+
+		if (entered === otpCode) {
+			// Mark as used in Supabase
+			try {
+				const { supabase } = await import('$lib/supabase.js');
+				if (supabase) {
+					await supabase.from('ping_otp_codes')
+						.update({ used: true })
+						.eq('phone', phone.trim())
+						.eq('code', otpCode);
+				}
+			} catch {}
+			try { localStorage.removeItem('ping_otp_session'); } catch {}
+			
+			otpVerified = true;
+			if (!locState.lat) { step = 'location'; } else { doSignUp(); }
+		} else {
+			otpAttempts++;
+			otpError = `Incorrect code. ${5 - otpAttempts} attempt${5-otpAttempts===1?'':'s'} remaining.`;
+		}
+	}
+	
+	// On mount: restore OTP session if user closed tab mid-verification
+	$effect(() => {
+		if (step === 'verify-phone' && !otpCode && !otpSent) {
+			try {
+				const saved = JSON.parse(localStorage.getItem('ping_otp_session') || '{}');
+				if (saved.phone === phone.trim() && saved.expires > Date.now()) {
+					otpCode = saved.code;
+					otpSent = true;
+				}
+			} catch {}
+		}
+	});
+
 	onMount(() => {
 		if ($userAuth.isVerified) goto('/dashboard');
 	});
@@ -75,7 +203,7 @@
 	function closeSheet() {
 		sheetOpen = false;
 		stopLocationWatch();
-		setTimeout(() => { step = 'lang'; error = ''; derivedVillage = null; locState = { lat: null, lng: null, region: null, error: null, accuracy: null }; }, 350);
+		setTimeout(() => { step = 'lang'; error = ''; derivedVillage = null; locState = { lat: null, lng: null, region: null, error: null, accuracy: null }; otpCode=''; otpEntry=''; otpSent=false; otpVerified=false; otpAttempts=0; otpError=''; }, 350);
 	}
 
 	// ── Language step ──────────────────────────────────────────────
@@ -129,8 +257,14 @@
 		if (!result.ok) { error = result.error; return; }
 		createdUsername = result.username;
 		createdVillageKey = result.villageKey;
-		if (result.needsConfirm) { step = 'confirm-email'; return; }
-		step = 'trust';
+		if (result.needsConfirm) {
+			// Email confirmation required — show "check email" screen
+			step = 'confirm-email';
+			return;
+		}
+		// Session created immediately (email confirm OFF) — go straight to dashboard
+		step = 'done';
+		setTimeout(() => goto('/dashboard'), 800);
 	}
 
 	// ── Sign in ────────────────────────────────────────────────────
@@ -139,10 +273,12 @@
 		if (!email.trim() || !email.includes('@')) { error = 'Enter your email.'; return; }
 		if (!password) { error = 'Enter your password.'; return; }
 		loading = true;
-		const { ok, error: e } = await signInEmail({ email, password });
+		const result = await signInEmail({ email, password });
 		loading = false;
-		if (!ok) { error = e; return; }
-		step = 'trust';
+		if (!result.ok) { error = result.error ?? result.e; return; }
+		// Auto-navigate to dashboard immediately — no extra step needed
+		step = 'done';
+		setTimeout(() => goto('/dashboard'), 600);
 	}
 
 	async function googleSignIn() {
@@ -152,7 +288,15 @@
 		if (!ok) error = e;
 	}
 
-	function finish() { step = 'done'; setTimeout(() => goto('/dashboard'), 1500); }
+	function finish() { step = 'done'; goto('/dashboard'); }
+
+	// Auto-proceed to dashboard after trust screen (user can still tap buttons)
+	$effect(() => {
+		if (step === 'trust') {
+			const t = setTimeout(() => goto('/dashboard'), 4000);
+			return () => clearTimeout(t);
+		}
+	});
 
 	const langLabels = { en:'English', pcm:'Pidgin', ha:'Hausa', ig:'Igbo', yo:'Yorùbá', ful:'Fulfulde', tiv:'Tiv', ijo:'Ijaw' };
 </script>
@@ -250,9 +394,9 @@
 					<input type="email" bind:value={email} placeholder="you@example.com" autocomplete="email" inputmode="email"/>
 				</div>
 				<div class="f">
-					<label>Password <span class="hint">min 8 chars</span></label>
+					<label>{T("password")} <span class="hint">{T("min8chars")}</span></label>
 					<div class="pw">
-						<input type={showPw?'text':'password'} bind:value={password} placeholder="Create a strong password" autocomplete="new-password"/>
+						<input type={showPw?'text':'password'} bind:value={password} placeholder={T("createStrongPw")} autocomplete="new-password"/>
 						<button class="eye" type="button" onclick={() => showPw=!showPw}>{showPw?'🙈':'👁️'}</button>
 					</div>
 				</div>
@@ -279,7 +423,7 @@
 					<svg width="18" height="18" viewBox="0 0 18 18"><path d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 002.38-5.88c0-.57-.05-.66-.15-1.18z" fill="#4285F4"/><path d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2.01c-.72.49-1.63.78-2.7.78-2.08 0-3.84-1.4-4.47-3.29H1.85v2.07A8 8 0 008.98 17z" fill="#34A853"/><path d="M4.51 10.54A4.8 4.8 0 014.26 9c0-.53.09-1.05.25-1.54V5.39H1.85A8 8 0 001 9c0 1.29.31 2.51.85 3.61l2.66-2.07z" fill="#FBBC05"/><path d="M8.98 4.17c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 001.85 5.4L4.5 7.46c.63-1.89 2.4-3.29 4.48-3.29z" fill="#EA4335"/></svg>
 					{T("googleSignIn")}
 				</button>
-				<p class="sw">Have an account? <button class="lnk" onclick={() => { mode='login'; error=''; }}>Log in</button></p>
+				<p class="sw">{T("haveAccount")} <button class="lnk" onclick={() => { mode='login'; error=''; }}>{T("logIn")}</button></p>
 				<p class="cl" role="button" tabindex="0" onclick={closeSheet} onkeydown={e=>e.key==='Enter'&&closeSheet()}>{T("returnCalc")}</p>
 			</div>
 
@@ -292,9 +436,9 @@
 					<input type="email" bind:value={email} placeholder="you@example.com" autocomplete="email" inputmode="email"/>
 				</div>
 				<div class="f">
-					<label>Password</label>
+					<label>{T("password")}</label>
 					<div class="pw">
-						<input type={showPw?'text':'password'} bind:value={password} placeholder="Your password" autocomplete="current-password"/>
+						<input type={showPw?'text':'password'} bind:value={password} placeholder={T("yourPassword")} autocomplete="current-password"/>
 						<button class="eye" type="button" onclick={() => showPw=!showPw}>{showPw?'🙈':'👁️'}</button>
 					</div>
 				</div>
@@ -307,12 +451,55 @@
 					<svg width="18" height="18" viewBox="0 0 18 18"><path d="M16.51 8H8.98v3h4.3c-.18 1-.74 1.48-1.6 2.04v2.01h2.6a7.8 7.8 0 002.38-5.88c0-.57-.05-.66-.15-1.18z" fill="#4285F4"/><path d="M8.98 17c2.16 0 3.97-.72 5.3-1.94l-2.6-2.01c-.72.49-1.63.78-2.7.78-2.08 0-3.84-1.4-4.47-3.29H1.85v2.07A8 8 0 008.98 17z" fill="#34A853"/><path d="M4.51 10.54A4.8 4.8 0 014.26 9c0-.53.09-1.05.25-1.54V5.39H1.85A8 8 0 001 9c0 1.29.31 2.51.85 3.61l2.66-2.07z" fill="#FBBC05"/><path d="M8.98 4.17c1.17 0 2.23.4 3.06 1.2l2.3-2.3A8 8 0 001.85 5.4L4.5 7.46c.63-1.89 2.4-3.29 4.48-3.29z" fill="#EA4335"/></svg>
 					{T("googleSignIn")}
 				</button>
-				<p class="sw">No account? <button class="lnk" onclick={() => { mode='signup'; error=''; }}>Sign up</button></p>
+				<p class="sw">{T("noAccount")} <button class="lnk" onclick={() => { mode='signup'; error=''; }}>{T("signUp")}</button></p>
 				<p class="cl" role="button" tabindex="0" onclick={closeSheet} onkeydown={e=>e.key==='Enter'&&closeSheet()}>{T("returnCalc")}</p>
 			</div>
 			{/if}
 
 		<!-- ─ LOCATION STEP ────────────────────────────────────── -->
+		{:else if step === 'verify-phone'}
+			<div class="sh-head">
+				<button class="x" onclick={() => { step='form'; otpSent=false; otpEntry=''; otpError=''; }}>← Back</button>
+			</div>
+			<div class="verify-body">
+				<div class="verify-icon">💬</div>
+				<h2 class="title">Verify via WhatsApp</h2>
+				<p class="verify-sub">We'll send a 6-digit code to your WhatsApp so you can verify your number.</p>
+
+				<div class="phone-display">
+					<span class="phone-flag">🇳🇬</span>
+					<span class="phone-num">{phone}</span>
+				</div>
+
+				{#if !otpSent}
+					<p class="verify-hint">Tap the button below — WhatsApp will open with your code pre-written. Send it to yourself.</p>
+					<button class="btn-wa" onclick={sendWhatsAppOTP}>
+						<svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+						Send Code via WhatsApp
+					</button>
+					<button class="skip-link" onclick={() => { otpVerified=true; if(!locState.lat){step='location';}else{doSignUp();} }}>
+						Skip — I don't use WhatsApp
+					</button>
+				{:else}
+					<p class="verify-hint">
+						WhatsApp should have opened. Send the message to yourself, then come back and enter the 6-digit code below.
+					</p>
+					<div class="otp-row">
+						<input class="otp-input" bind:value={otpEntry} placeholder="Enter 6-digit code"
+							maxlength="6" inputmode="numeric" pattern="[0-9]*"
+							onkeydown={(e) => e.key === 'Enter' && verifyOTP()}/>
+						<button class="btn-p otp-btn" onclick={verifyOTP}>Verify</button>
+					</div>
+					{#if otpError}<p class="err">{otpError}</p>{/if}
+					<div class="otp-actions">
+						<button class="skip-link" onclick={sendWhatsAppOTP}>Resend code</button>
+						<button class="skip-link" onclick={() => { otpVerified=true; if(!locState.lat){step='location';}else{doSignUp();} }}>
+							Skip verification
+						</button>
+					</div>
+				{/if}
+			</div>
+
 		{:else if step === 'location'}
 			<div class="sh-head"><button class="x" onclick={() => { step='form'; error=''; }}>← Back</button></div>
 			<div class="body center">
@@ -334,7 +521,7 @@
 			</div>
 			<div class="foot">
 				{#if !locState.lat}
-					<button class="btn-p" onclick={requestLocation} disabled={locLoading}>{locLoading?T('gettingLocation'):'📍 Allow location access'}</button>
+					<button class="btn-p" onclick={requestLocation} disabled={locLoading}>{locLoading?T('gettingLocation'):T('allowLocation')}</button>
 				{:else}
 					<button class="btn-p" onclick={doSignUp} disabled={loading}>{loading?'Creating account…':'Continue →'}</button>
 				{/if}
@@ -490,4 +677,20 @@
 @keyframes pop{from{transform:scale(.4);opacity:0}to{transform:scale(1);opacity:1}}
 .loading-dot{font-size:.7rem;color:#bbb;animation:blink 1s infinite;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.verify-body{display:flex;flex-direction:column;align-items:center;gap:.85rem;padding:1.5rem 1rem;text-align:center;}
+.verify-icon{font-size:3rem;}
+.verify-sub{font-size:.78rem;color:#7a8fa8;line-height:1.6;margin:0;}
+.verify-hint{font-size:.74rem;color:#7a8fa8;line-height:1.6;margin:0;padding:0 .5rem;}
+.phone-display{display:flex;align-items:center;gap:.5rem;background:#111822;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:.6rem 1rem;}
+.phone-flag{font-size:1.2rem;}
+.phone-num{font-size:.9rem;font-weight:700;color:#e8edf3;font-family:monospace;}
+.btn-wa{display:flex;align-items:center;gap:.5rem;background:#25D366;color:#fff;border:none;border-radius:14px;padding:.85rem 1.5rem;font-size:.88rem;font-weight:700;cursor:pointer;width:100%;justify-content:center;-webkit-tap-highlight-color:transparent;touch-action:manipulation;}
+.btn-wa:active{background:#1ea855;}
+.skip-link{background:none;border:none;color:#3f5166;font-size:.7rem;cursor:pointer;text-decoration:underline;padding:.25rem;-webkit-tap-highlight-color:transparent;}
+.skip-link:hover{color:#7a8fa8;}
+.otp-row{display:flex;gap:.5rem;width:100%;}
+.otp-input{flex:1;background:#111822;border:1.5px solid rgba(41,182,246,.35);border-radius:12px;padding:.7rem .85rem;color:#e8edf3;font-size:1.1rem;font-weight:700;letter-spacing:.2em;text-align:center;outline:none;font-family:monospace;}
+.otp-input:focus{border-color:#29b6f6;}
+.otp-btn{flex-shrink:0;padding:.7rem 1.2rem;font-size:.82rem;}
+.otp-actions{display:flex;justify-content:space-between;width:100%;padding:0 .25rem;}
 </style>

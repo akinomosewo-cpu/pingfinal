@@ -97,10 +97,46 @@ function _getLocationUtils() {
 }
 
 // ── Username ─────────────────────────────────────────────────────
-export function generateUsername(firstName, lastName) {
+export function generateUsername(firstName, lastName, userId) {
 	const base = ((firstName ?? '').slice(0, 3) + (lastName ?? '').slice(0, 3))
-		.toLowerCase().replace(/[^a-z]/g, '');
-	return `${base}${Math.floor(1000 + Math.random() * 9000)}`;
+		.toLowerCase().replace(/[^a-z]/g, '') || 'user';
+	// Use last 4 chars of userId for uniqueness, fallback to random
+	const uid4 = userId ? String(userId).replace(/-/g,'').slice(-4) : Math.floor(1000 + Math.random() * 9000);
+	return `${base}${uid4}`;
+}
+
+// Ensure every existing user who has no username gets one generated and saved
+export async function ensureUsername(user, meta, existingUsername) {
+	if (existingUsername && existingUsername.trim() && existingUsername !== 'Not set') {
+		return existingUsername;
+	}
+	const firstName = meta.first_name ?? meta.firstName ?? '';
+	const lastName  = meta.last_name  ?? meta.lastName  ?? '';
+	const generated = generateUsername(firstName, lastName, user.id);
+	// Persist to Supabase if possible
+	try {
+		const { supabase } = await import('./supabase.js');
+		if (supabase) {
+			await supabase.from('ping_users')
+				.update({ username: generated })
+				.eq('id', user.id);
+			// Also update auth metadata
+			await supabase.auth.updateUser({ data: { username: generated } });
+		}
+	} catch {}
+	// Persist to localStorage token
+	if (typeof localStorage !== 'undefined') {
+		try {
+			const raw = localStorage.getItem('ping_auth_v5');
+			if (raw) {
+				const { payload, sig } = JSON.parse(raw);
+				const data = JSON.parse(atob(payload));
+				data.username = generated;
+				localStorage.setItem('ping_auth_v5', JSON.stringify({ payload: btoa(JSON.stringify(data)), sig }));
+			}
+		} catch {}
+	}
+	return generated;
 }
 
 // ── Sign Up ───────────────────────────────────────────────────────
@@ -124,7 +160,9 @@ export async function signUpEmail({ email, password, firstName, lastName, phone,
 			password,
 			options: {
 				data: { first_name: firstName, last_name: lastName, username, village_key: key, village_name: region?.name ?? 'Nigeria' },
-				emailRedirectTo: `${window.location.origin}/auth/callback`
+				emailRedirectTo: `${window.location.origin}/auth/callback`,
+				// If email confirmation is disabled in Supabase, this is ignored
+				// To disable: Supabase → Auth → Settings → Confirm email: OFF
 			}
 		});
 		if (error) return { ok: false, error: error.message };
@@ -137,7 +175,9 @@ export async function signUpEmail({ email, password, firstName, lastName, phone,
 		_setAuth({ userId: uid, email: email.trim().toLowerCase(), firstName, lastName, phone, role, username, villageKey: finalKey, villageDisplayName: region?.name ?? 'Nigeria', villageId: uid ? `v_${uid.slice(0,8)}` : null, region, language, authMethod: 'email' });
 		await _saveToken();
 
-		return { ok: true, needsConfirm: !data.session, username, villageKey: finalKey };
+		// needsConfirm = true means email sent, user must click link
+		// needsConfirm = false means session created immediately — go to dashboard
+		return { ok: true, needsConfirm: !data.session, username, villageKey: finalKey, session: data.session };
 	} catch (e) {
 		return { ok: false, error: e.message ?? 'Sign-up failed' };
 	}
@@ -153,19 +193,22 @@ export async function signInEmail({ email, password }) {
 		if (error) return { ok: false, error: error.message };
 		await _hydrateFromSupabase(data.user);
 		// Guarantee isVerified is set — _hydrateFromSupabase may bail if no DB profile yet
-		if (!_auth.isVerified) {
+		// Always ensure user is verified after successful auth
+		if (!_auth.isVerified || !_auth.username) {
+			const meta2 = data.user.user_metadata ?? {};
+			const u2 = await ensureUsername(data.user, meta2, meta2.username ?? '');
 			_setAuth({
 				userId:    data.user.id,
 				email:     data.user.email ?? email,
-				firstName: data.user.user_metadata?.first_name ?? '',
-				lastName:  data.user.user_metadata?.last_name  ?? '',
-				username:  data.user.user_metadata?.username   ?? '',
-				villageKey: data.user.user_metadata?.village_key ?? '',
+				firstName: meta2.first_name ?? '',
+				lastName:  meta2.last_name  ?? '',
+				username:  u2,
+				villageKey: meta2.village_key ?? '',
 				authMethod: 'email',
 			});
 		}
 		await _saveToken();
-		return { ok: true };
+		return { ok: true, redirect: '/dashboard' };
 	} catch (e) {
 		return { ok: false, error: e.message ?? 'Sign-in failed' };
 	}
@@ -177,9 +220,17 @@ export async function signInWithGoogle() {
 	try {
 		const { supabase } = await import('./supabase.js');
 		if (!supabase) return { ok: false, error: 'No network.' };
+		// redirectTo must match EXACTLY what's registered in:
+		// Supabase Dashboard → Auth → URL Configuration → Redirect URLs
+		// Add BOTH: https://pingfinalng.vercel.app/auth/callback
+		//       AND: https://ping.com.ng/auth/callback
+		const siteOrigin = import.meta.env.VITE_SITE_URL?.replace(/\/$/, '') || window.location.origin;
 		const { error } = await supabase.auth.signInWithOAuth({
 			provider: 'google',
-			options: { redirectTo: `${window.location.origin}/auth/callback`, queryParams: { prompt: 'select_account' } }
+			options: {
+				redirectTo: `${siteOrigin}/auth/callback`,
+				queryParams: { prompt: 'select_account', access_type: 'offline' }
+			}
 		});
 		if (error) return { ok: false, error: error.message };
 		return { ok: true };
@@ -253,10 +304,12 @@ async function _hydrateFromSupabase(user) {
 		const { data: p } = await supabase.from('ping_users').select('*').eq('id', user.id).single();
 		// Always authenticate — use DB profile if available, fall back to Supabase user metadata
 		const meta = user.user_metadata ?? {};
+		const rawUsername = p?.username ?? meta.username ?? '';
+		const username = await ensureUsername(user, meta, rawUsername);
 		_setAuth({
 			userId:             user.id,
 			email:              p?.email              ?? user.email        ?? '',
-			username:           p?.username           ?? meta.username     ?? '',
+			username,
 			firstName:          p?.first_name         ?? meta.first_name   ?? '',
 			lastName:           p?.last_name          ?? meta.last_name    ?? '',
 			phone:              p?.phone              ?? '',
@@ -267,7 +320,17 @@ async function _hydrateFromSupabase(user) {
 			language:           p?.language           ?? 'en',
 			authMethod:         user.phone ? 'sms' : 'email',
 		});
-	} catch { }
+	} catch(e) {
+		// Table may not exist yet — still mark as verified so user can use the app
+		const meta = user.user_metadata ?? {};
+		_setAuth({
+			userId: user.id, email: user.email ?? '',
+			username: meta.username || generateUsername(meta.first_name??'', meta.last_name??'', user.id),
+			firstName: meta.first_name ?? '', lastName: meta.last_name ?? '',
+			villageKey: meta.village_key ?? '', villageDisplayName: meta.village_name ?? 'Nigeria',
+			authMethod: 'email', role: meta.role ?? 'resident',
+		});
+	}
 }
 
 async function _hydrateFromLocalStorage() {
@@ -304,17 +367,39 @@ async function _hmacVerify(data, sig) { return (await _hmacSign(data)) === sig; 
 
 // ── Search users ──────────────────────────────────────────────────
 export async function searchUsers(query) {
-	if (!browser || !query?.trim()) return [];
+	if (!browser) return [];
+	const q = (query ?? '').trim().replace(/^@+/, '').toLowerCase();
 	try {
 		const { supabase } = await import('./supabase.js');
 		if (!supabase) return [];
-		const q = query.trim().toLowerCase();
+
+		// Empty query = load all users (for suggestions panel)
+		if (!q) {
+			const { data } = await supabase
+				.from('ping_users')
+				.select('id, username, first_name, last_name, village_key, village_name')
+				.not('username', 'is', null)
+				.order('created_at', { ascending: false })
+				.limit(30);
+			return data ?? [];
+		}
+
+		// Try the fast SQL function first
+		const { data: rpcData, error: rpcErr } = await supabase
+			.rpc('search_ping_users', { q });
+		if (!rpcErr && rpcData) return rpcData;
+
+		// Fallback: direct OR query
 		const { data, error } = await supabase
 			.from('ping_users')
-			.select('id, username, first_name, last_name, village_key, village_name, last_seen')
+			.select('id, username, first_name, last_name, village_key, village_name')
 			.or(`username.ilike.%${q}%,first_name.ilike.%${q}%,last_name.ilike.%${q}%`)
-			.limit(20);
-		if (error) return [];
+			.order('username', { ascending: true })
+			.limit(30);
+		if (error) { console.warn('[Search]', error.message); return []; }
 		return data ?? [];
-	} catch { return []; }
+	} catch(e) {
+		console.warn('[Search] exception:', e.message);
+		return [];
+	}
 }
